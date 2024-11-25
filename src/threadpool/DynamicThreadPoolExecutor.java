@@ -4,7 +4,7 @@ import java.util.concurrent.*;
 
 /**
  * 动态线程池
- * 根据负载情况自动调整核心线程数
+ * 根据负载情况自动调整核心线程数与最大线程数
  * 扩容是将线程池的核心线程、最大线程数翻倍，分别最大扩容到maxCorePoolSize、maxMaximumPoolSize
  * 缩容是将线程池的核心线程、最大线程数缩小一倍，分别最小缩容到initCorePoolSize、initMaximumPoolSize
  * 扩容条件:
@@ -54,12 +54,20 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     
     private final Semaphore semaphore;
     
+    public DynamicThreadPoolExecutor(int corePoolSize) {
+        this(corePoolSize,
+            corePoolSize * 2,
+            1, TimeUnit.MINUTES,
+            new ArrayBlockingQueue<>(corePoolSize));
+    }
+    
     public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue) {
         this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, Executors.defaultThreadFactory());
     }
     
     public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory) {
-        this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, corePoolSize, corePoolSize << 3, maximumPoolSize << 3);
+        this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, workQueue.remainingCapacity(),
+            corePoolSize << 2, maximumPoolSize << 2);
     }
     
     /**
@@ -77,7 +85,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                                      BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory,
                                      int resizeThreshold, int maxCorePoolSize, int maxMaximumPoolSize) {
         super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
-        if (resizeThreshold < corePoolSize) {
+        if (resizeThreshold <= 0) {
             throw new IllegalArgumentException();
         }
         if (maxCorePoolSize < 0 || maxCorePoolSize < corePoolSize) {
@@ -91,7 +99,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.initResizeThreshold = resizeThreshold;
         this.resizeTime = System.currentTimeMillis();
         this.workQueue = workQueue;
-        this.resizeIntervalTime = unit.toMinutes(keepAliveTime);
+        this.resizeIntervalTime = unit.toMillis(keepAliveTime);
         this.resizeThreshold = resizeThreshold;
         this.maxCorePoolSize = maxCorePoolSize;
         this.maxMaximumPoolSize = maxMaximumPoolSize;
@@ -111,7 +119,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         long currentTimeMillis = System.currentTimeMillis();
         // 扩容
         if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
-            && activeCount == maximumPoolSize
+            && activeCount >= maximumPoolSize
             && workerQueueSize >= resizeThreshold
             && semaphore.tryAcquire()) {
             int newCorePoolSize = corePoolSize << 1;
@@ -129,7 +137,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             this.resizeThreshold = resizeThreshold;
             setCorePoolSize(newCorePoolSize);
             setMaximumPoolSize(newMaximumPoolSize);
-            resizeTime = System.currentTimeMillis();
+            resizeTime = currentTimeMillis;
             System.out.printf("扩容后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", newCorePoolSize, newMaximumPoolSize, resizeThreshold, activeCount, workerQueueSize);
             semaphore.release();
             return;
@@ -137,7 +145,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         // 缩容
         if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
             && activeCount > initCorePoolSize
-            && activeCount == corePoolSize
+            && activeCount <= corePoolSize
             && workerQueueSize == 0
             && currentTimeMillis - resizeTime >= resizeIntervalTime
             && semaphore.tryAcquire()) {
@@ -147,7 +155,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             setMaximumPoolSize(newMaximumPoolSize);
             int resizeThreshold = Math.max(this.resizeThreshold >> 1, initResizeThreshold);
             this.resizeThreshold = resizeThreshold;
-            resizeTime = System.currentTimeMillis();
+            resizeTime = currentTimeMillis;
             System.out.printf("缩容后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", newCorePoolSize, newMaximumPoolSize, resizeThreshold, activeCount, workerQueueSize);
             semaphore.release();
         }
