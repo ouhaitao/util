@@ -24,13 +24,9 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
      */
     private final int initMaximumPoolSize;
     /**
-     * 初始扩容阈值
-     */
-    private final int initResizeThreshold;
-    /**
      * 扩容阈值
      */
-    private volatile int resizeThreshold;
+    private final int resizeThreshold;
     /**
      * 能够扩容到的最大核心线程数
      */
@@ -39,10 +35,6 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
      * 能够扩容的最大线程数
      */
     private volatile int maxMaximumPoolSize;
-    /**
-     * 等待队列
-     */
-    private final BlockingQueue<Runnable> workQueue;
     /**
      * 上一次扩容/缩容的时间
      */
@@ -61,12 +53,34 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             new ArrayBlockingQueue<>(corePoolSize));
     }
     
-    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue) {
+    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize,
+                                     long keepAliveTime, TimeUnit unit,
+                                     BlockingQueue<Runnable> workQueue) {
         this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, Executors.defaultThreadFactory());
     }
     
-    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit, BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory) {
-        this(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, workQueue.remainingCapacity(),
+    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize,
+                                     long keepAliveTime, TimeUnit unit,
+                                     BlockingQueue<Runnable> workQueue,
+                                     ThreadFactory threadFactory) {
+        this(corePoolSize, maximumPoolSize,
+            keepAliveTime, unit,
+            workQueue,
+            threadFactory,
+            new AbortPolicy());
+    }
+    
+    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize,
+                                     long keepAliveTime, TimeUnit unit,
+                                     BlockingQueue<Runnable> workQueue,
+                                     ThreadFactory threadFactory,
+                                     RejectedExecutionHandler handler) {
+        this(corePoolSize, maximumPoolSize,
+            keepAliveTime, unit,
+            workQueue,
+            threadFactory,
+            handler,
+            workQueue.remainingCapacity(),
             corePoolSize << 2, maximumPoolSize << 2);
     }
     
@@ -81,11 +95,14 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
      * @param maxCorePoolSize    最大扩容到的核心线程数
      * @param maxMaximumPoolSize 最大扩容到的最大线程数
      */
-    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize, long keepAliveTime, TimeUnit unit,
-                                     BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory,
+    public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize,
+                                     long keepAliveTime, TimeUnit unit,
+                                     BlockingQueue<Runnable> workQueue,
+                                     ThreadFactory threadFactory,
+                                     RejectedExecutionHandler handler,
                                      int resizeThreshold, int maxCorePoolSize, int maxMaximumPoolSize) {
-        super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
-        if (resizeThreshold <= 0) {
+        super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler);
+        if (resizeThreshold <= 0 || resizeThreshold > workQueue.remainingCapacity()) {
             throw new IllegalArgumentException();
         }
         if (maxCorePoolSize < 0 || maxCorePoolSize < corePoolSize) {
@@ -96,14 +113,13 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         }
         this.initCorePoolSize = corePoolSize;
         this.initMaximumPoolSize = maximumPoolSize;
-        this.initResizeThreshold = resizeThreshold;
         this.resizeTime = System.currentTimeMillis();
-        this.workQueue = workQueue;
         this.resizeIntervalTime = unit.toMillis(keepAliveTime);
         this.resizeThreshold = resizeThreshold;
         this.maxCorePoolSize = maxCorePoolSize;
         this.maxMaximumPoolSize = maxMaximumPoolSize;
         this.semaphore = new Semaphore(1);
+        setRejectedExecutionHandler(new ResizePolicy(this, handler));
     }
     
     @Override
@@ -111,11 +127,15 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         resize();
     }
     
-    private void resize() {
+    /**
+     * 扩容/缩容
+     * @return true:扩容/缩容成功
+     */
+    private boolean resize() {
         int maximumPoolSize = getMaximumPoolSize();
         int activeCount = getActiveCount();
         int corePoolSize = getCorePoolSize();
-        int workerQueueSize = workQueue.size();
+        int workerQueueSize = getQueue().size();
         long currentTimeMillis = System.currentTimeMillis();
         // 扩容
         if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
@@ -130,21 +150,15 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             if (newMaximumPoolSize < 0) {
                 newMaximumPoolSize = maxMaximumPoolSize;
             }
-            int resizeThreshold = this.resizeThreshold << 1;
-            if (resizeThreshold < 0) {
-                resizeThreshold = Integer.MAX_VALUE;
-            }
-            this.resizeThreshold = resizeThreshold;
             setCorePoolSize(newCorePoolSize);
             setMaximumPoolSize(newMaximumPoolSize);
             resizeTime = currentTimeMillis;
             System.out.printf("扩容后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", newCorePoolSize, newMaximumPoolSize, resizeThreshold, activeCount, workerQueueSize);
             semaphore.release();
-            return;
+            return true;
         }
         // 缩容
         if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
-            && activeCount > initCorePoolSize
             && activeCount <= corePoolSize
             && workerQueueSize == 0
             && currentTimeMillis - resizeTime >= resizeIntervalTime
@@ -153,12 +167,12 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             int newMaximumPoolSize = Math.max(maximumPoolSize >> 1, initMaximumPoolSize);
             setCorePoolSize(newCorePoolSize);
             setMaximumPoolSize(newMaximumPoolSize);
-            int resizeThreshold = Math.max(this.resizeThreshold >> 1, initResizeThreshold);
-            this.resizeThreshold = resizeThreshold;
             resizeTime = currentTimeMillis;
             System.out.printf("缩容后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", newCorePoolSize, newMaximumPoolSize, resizeThreshold, activeCount, workerQueueSize);
             semaphore.release();
+            return true;
         }
+        return false;
     }
     
     public void setMaxCorePoolSize(int maxCorePoolSize) {
@@ -179,22 +193,53 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.resizeIntervalTime = resizeIntervalTime;
     }
     
+    protected long getResizeTime() {
+        return resizeTime;
+    }
+    
+    protected static class ResizePolicy implements RejectedExecutionHandler {
+    
+        private DynamicThreadPoolExecutor executor;
+        
+        private RejectedExecutionHandler handler;
+    
+        public ResizePolicy(DynamicThreadPoolExecutor executor, RejectedExecutionHandler handler) {
+            this.executor = executor;
+            this.handler = handler;
+        }
+    
+        @Override
+        public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+            if (executor.resize()) {
+                // 没有扩容成功执行拒绝策略
+                handler.rejectedExecution(r, e);
+            } else {
+                // 扩容成功重新提交
+                e.execute(r);
+            }
+        }
+    }
+    
     public static void main(String[] args) {
-        DynamicThreadPoolExecutor dynamicThreadPoolExecutor = new DynamicThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+        DynamicThreadPoolExecutor dynamicThreadPoolExecutor =
+            new DynamicThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(1));
         for (int i = 1; i < 10; i++) {
             int finalI = i;
             Runnable task = () -> {
                 try {
+                    System.out.println("第" + finalI + "个线程启动");
                     Thread.sleep(finalI * 1000L);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
+                    System.out.println("第" + finalI + "个线程异常");
                 }
+                System.out.println("第" + finalI + "个线程退出");
             };
+            System.out.println("第" + finalI + "个线程提交");
             dynamicThreadPoolExecutor.execute(task);
-        }
-        while (true) {
             try {
-                Thread.sleep(10000L);
+                Thread.sleep(1000L);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
