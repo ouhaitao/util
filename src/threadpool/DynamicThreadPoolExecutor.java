@@ -101,7 +101,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                                      ThreadFactory threadFactory,
                                      RejectedExecutionHandler handler,
                                      int resizeThreshold, int maxCorePoolSize, int maxMaximumPoolSize) {
-        super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler);
+        super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, new ResizePolicy(handler));
         if (resizeThreshold <= 0 || resizeThreshold > workQueue.remainingCapacity()) {
             throw new IllegalArgumentException();
         }
@@ -119,7 +119,6 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.maxCorePoolSize = maxCorePoolSize;
         this.maxMaximumPoolSize = maxMaximumPoolSize;
         this.semaphore = new Semaphore(1);
-        setRejectedExecutionHandler(new ResizePolicy(this, handler));
     }
     
     @Override
@@ -199,18 +198,15 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     
     protected static class ResizePolicy implements RejectedExecutionHandler {
     
-        private DynamicThreadPoolExecutor executor;
-        
         private RejectedExecutionHandler handler;
     
-        public ResizePolicy(DynamicThreadPoolExecutor executor, RejectedExecutionHandler handler) {
-            this.executor = executor;
+        public ResizePolicy(RejectedExecutionHandler handler) {
             this.handler = handler;
         }
     
         @Override
         public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
-            if (executor.resize()) {
+            if (((DynamicThreadPoolExecutor) e).resize()) {
                 // 没有扩容成功执行拒绝策略
                 handler.rejectedExecution(r, e);
             } else {
