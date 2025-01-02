@@ -1,6 +1,8 @@
 package threadpool;
 
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * 动态线程池
@@ -44,13 +46,15 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
      */
     private volatile long resizeIntervalTime;
     
-    private final Semaphore semaphore;
+    private final AtomicBoolean resizeLock;
+    
+    private final Thread resizeThread;
     
     public DynamicThreadPoolExecutor(int corePoolSize) {
         this(corePoolSize,
             corePoolSize * 2,
             1, TimeUnit.MINUTES,
-            new ArrayBlockingQueue<>(corePoolSize));
+            new LinkedBlockingQueue<>(corePoolSize));
     }
     
     public DynamicThreadPoolExecutor(int corePoolSize, int maximumPoolSize,
@@ -113,17 +117,46 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         }
         this.initCorePoolSize = corePoolSize;
         this.initMaximumPoolSize = maximumPoolSize;
-        this.resizeTime = System.currentTimeMillis();
-        this.resizeIntervalTime = unit.toMillis(keepAliveTime);
+        this.resizeTime = System.nanoTime();
+        this.resizeIntervalTime = unit.toNanos(keepAliveTime);
         this.resizeThreshold = resizeThreshold;
         this.maxCorePoolSize = maxCorePoolSize;
         this.maxMaximumPoolSize = maxMaximumPoolSize;
-        this.semaphore = new Semaphore(1);
+        this.resizeLock = new AtomicBoolean(false);
+        this.resizeThread = new Thread(() -> {
+            while (true) {
+                LockSupport.park(resizeIntervalTime);
+                lock();
+                resize();
+                unlock();
+            }
+        });
+        resizeThread.setDaemon(true);
+        resizeThread.start();
     }
     
     @Override
     protected void afterExecute(Runnable r, Throwable t) {
-        resize();
+        int maximumPoolSize = getMaximumPoolSize();
+        int activeCount = getActiveCount();
+        int corePoolSize = getCorePoolSize();
+        int workerQueueSize = getQueue().size();
+        
+        // 扩容
+        if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
+            && activeCount >= maximumPoolSize
+            && workerQueueSize >= resizeThreshold
+            && !resizeLock.get()) {
+            LockSupport.unpark(resizeThread);
+        }
+    
+        // 缩容
+        if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
+            && activeCount <= corePoolSize
+            && workerQueueSize == 0
+            && !resizeLock.get()) {
+            LockSupport.unpark(resizeThread);
+        }
     }
     
     /**
@@ -131,60 +164,59 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
      */
     private ResizeResult resize() {
         ResizeResult resizeResult = ResizeResult.FAIL;
+        long nanoTime = System.nanoTime();
         // 自旋
-        for (;;) {
-            int maximumPoolSize = getMaximumPoolSize();
-            int activeCount = getActiveCount();
-            int corePoolSize = getCorePoolSize();
-            int workerQueueSize = getQueue().size();
-            long currentTimeMillis = System.currentTimeMillis();
-            // 扩容
-            if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
-                && activeCount >= maximumPoolSize
-                && workerQueueSize >= resizeThreshold) {
-                if (!semaphore.tryAcquire()) {
-                    // 被其他线程抢占
-                    resizeResult = ResizeResult.RESIZED;
-                    continue;
-                }
-                int newCorePoolSize = corePoolSize << 1;
-                if (newCorePoolSize < 0 || newCorePoolSize > maxCorePoolSize) {
-                    newCorePoolSize = maximumPoolSize;
-                }
-                int newMaximumPoolSize = maximumPoolSize << 1;
-                if (newMaximumPoolSize < 0) {
-                    newMaximumPoolSize = maxMaximumPoolSize;
-                }
-                setCorePoolSize(newCorePoolSize);
-                setMaximumPoolSize(newMaximumPoolSize);
-                resizeTime = currentTimeMillis;
-                semaphore.release();
-                resizeResult = ResizeResult.SUCCESS;
-                break;
+        int maximumPoolSize = getMaximumPoolSize();
+        int activeCount = getActiveCount();
+        int corePoolSize = getCorePoolSize();
+        int workerQueueSize = getQueue().size();
+        // 扩容
+        if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
+            && activeCount >= maximumPoolSize
+            && workerQueueSize >= resizeThreshold) {
+        
+            int newCorePoolSize = corePoolSize << 1;
+            if (newCorePoolSize < 0 || newCorePoolSize > maxCorePoolSize) {
+                newCorePoolSize = maximumPoolSize;
             }
-            // 缩容
-            if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
-                && activeCount <= corePoolSize
-                && workerQueueSize == 0
-                && currentTimeMillis - resizeTime >= resizeIntervalTime) {
-                if (!semaphore.tryAcquire()) {
-                    // 被其他线程抢占
-                    resizeResult = ResizeResult.RESIZED;
-                    continue;
-                }
-                int newCorePoolSize = Math.max(corePoolSize >> 1, initCorePoolSize);
-                int newMaximumPoolSize = Math.max(maximumPoolSize >> 1, initMaximumPoolSize);
-                setCorePoolSize(newCorePoolSize);
-                setMaximumPoolSize(newMaximumPoolSize);
-                resizeTime = currentTimeMillis;
-                semaphore.release();
-                resizeResult = ResizeResult.SUCCESS;
-                break;
+            int newMaximumPoolSize = maximumPoolSize << 1;
+            if (newMaximumPoolSize < 0) {
+                newMaximumPoolSize = maxMaximumPoolSize;
             }
-            break;
+            setCorePoolSize(newCorePoolSize);
+            setMaximumPoolSize(newMaximumPoolSize);
+            resizeTime = nanoTime;
+            resizeResult = ResizeResult.SUCCESS;
         }
-        System.out.printf("resize后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", getCorePoolSize(), getMaximumPoolSize(), resizeThreshold, getActiveCount(), getQueue().size());
+        // 缩容
+        if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
+            && activeCount <= corePoolSize
+            && workerQueueSize == 0
+            && nanoTime - resizeTime >= resizeIntervalTime) {
+        
+            int newCorePoolSize = Math.max(corePoolSize >> 1, initCorePoolSize);
+            int newMaximumPoolSize = Math.max(maximumPoolSize >> 1, initMaximumPoolSize);
+            setCorePoolSize(newCorePoolSize);
+            setMaximumPoolSize(newMaximumPoolSize);
+            resizeTime = nanoTime;
+            resizeResult = ResizeResult.SUCCESS;
+        }
+        if (resizeResult == ResizeResult.SUCCESS) {
+            System.out.printf("resize后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", getCorePoolSize(), getMaximumPoolSize(), resizeThreshold, getActiveCount(), getQueue().size());
+        }
         return resizeResult;
+    }
+    
+    protected boolean lock() {
+        return resizeLock.compareAndSet(false, true);
+    }
+    
+    protected boolean isLock() {
+        return resizeLock.get();
+    }
+    
+    protected void unlock() {
+        resizeLock.set(false);
     }
     
     public void setMaxCorePoolSize(int maxCorePoolSize) {
@@ -219,12 +251,25 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     
         @Override
         public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
-            if (((DynamicThreadPoolExecutor) e).resize() == ResizeResult.FAIL) {
-                // 没有扩容成功执行拒绝策略
-                handler.rejectedExecution(r, e);
-            } else {
-                // 扩容成功重新提交
-                e.execute(r);
+            DynamicThreadPoolExecutor executor = (DynamicThreadPoolExecutor) e;
+            while (!executor.isLock()) {
+                for (int i = 0; i < 100; i++) {
+                    if (executor.lock()) {
+                        break;
+                    }
+                }
+                Thread.yield();
+            }
+            try {
+                if (executor.resize() == ResizeResult.SUCCESS) {
+                    // 扩容成功重新提交
+                    e.execute(r);
+                } else {
+                    // 没有扩容成功执行拒绝策略
+                    handler.rejectedExecution(r, e);
+                }
+            } finally {
+                executor.unlock();
             }
         }
     }
@@ -237,10 +282,6 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
          * 扩容成功
          */
         SUCCESS,
-        /**
-         * 被其他线程抢占
-         */
-        RESIZED,
         /**
          * 扩容失败
          */
