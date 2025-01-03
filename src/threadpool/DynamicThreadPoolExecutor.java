@@ -124,39 +124,14 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.maxMaximumPoolSize = maxMaximumPoolSize;
         this.resizeLock = new AtomicBoolean(false);
         this.resizeThread = new Thread(() -> {
-            while (true) {
+            while (!isShutdown()) {
                 LockSupport.park(resizeIntervalTime);
                 lock();
                 resize();
                 unlock();
             }
         });
-        resizeThread.setDaemon(true);
         resizeThread.start();
-    }
-    
-    @Override
-    protected void afterExecute(Runnable r, Throwable t) {
-        int maximumPoolSize = getMaximumPoolSize();
-        int activeCount = getActiveCount();
-        int corePoolSize = getCorePoolSize();
-        int workerQueueSize = getQueue().size();
-        
-        // 扩容
-        if ((corePoolSize < maxCorePoolSize || maximumPoolSize < maxMaximumPoolSize)
-            && activeCount >= maximumPoolSize
-            && workerQueueSize >= resizeThreshold
-            && !resizeLock.get()) {
-            LockSupport.unpark(resizeThread);
-        }
-    
-        // 缩容
-        if ((corePoolSize > initCorePoolSize || maximumPoolSize > initMaximumPoolSize)
-            && activeCount <= corePoolSize
-            && workerQueueSize == 0
-            && !resizeLock.get()) {
-            LockSupport.unpark(resizeThread);
-        }
     }
     
     /**
@@ -165,7 +140,6 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     private ResizeResult resize() {
         ResizeResult resizeResult = ResizeResult.FAIL;
         long nanoTime = System.nanoTime();
-        // 自旋
         int maximumPoolSize = getMaximumPoolSize();
         int activeCount = getActiveCount();
         int corePoolSize = getCorePoolSize();
@@ -177,7 +151,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         
             int newCorePoolSize = corePoolSize << 1;
             if (newCorePoolSize < 0 || newCorePoolSize > maxCorePoolSize) {
-                newCorePoolSize = maximumPoolSize;
+                newCorePoolSize = maxCorePoolSize;
             }
             int newMaximumPoolSize = maximumPoolSize << 1;
             if (newMaximumPoolSize < 0) {
@@ -202,13 +176,26 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             resizeResult = ResizeResult.SUCCESS;
         }
         if (resizeResult == ResizeResult.SUCCESS) {
+            // 简单的日志输出
+            // 实际项目应该使用日志框架
             System.out.printf("resize后当前corePoolSize=%s 当前maximumPoolSize=%s 下次扩容阈值=%s 当前存活线程数=%s 等待队列长度=%s %n", getCorePoolSize(), getMaximumPoolSize(), resizeThreshold, getActiveCount(), getQueue().size());
         }
         return resizeResult;
     }
     
-    protected boolean lock() {
+    protected boolean tryLock() {
         return resizeLock.compareAndSet(false, true);
+    }
+    
+    protected boolean lock() {
+        while (true) {
+            for (int i = 0; i < 100; i++) {
+                if (tryLock()) {
+                    return true;
+                }
+            }
+            Thread.yield();
+        }
     }
     
     protected boolean isLock() {
@@ -252,16 +239,19 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         @Override
         public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
             DynamicThreadPoolExecutor executor = (DynamicThreadPoolExecutor) e;
-            while (!executor.isLock()) {
+            // 自旋
+            int j = 0;
+            while (!executor.isLock() && j < 100) {
                 for (int i = 0; i < 100; i++) {
-                    if (executor.lock()) {
+                    if (executor.tryLock()) {
                         break;
                     }
                 }
+                j++;
                 Thread.yield();
             }
             try {
-                if (executor.resize() == ResizeResult.SUCCESS) {
+                if (j < 100 && executor.resize() == ResizeResult.SUCCESS) {
                     // 扩容成功重新提交
                     e.execute(r);
                 } else {
